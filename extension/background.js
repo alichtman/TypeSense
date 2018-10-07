@@ -4,135 +4,111 @@
 // For calling GET and SET to the extension's local storage
 const storage = chrome.storage.local;
 
-/*
-// Pulls user's unique authentication token
-chrome.identity.getAuthToken({interactive: true}, (token) => {
-	if (chrome.runtime.lastError) {
-		console.log("Error retrieving authToken: " + chrome.runtime.lastError.message);
-		return;
-	}
-	var oauth = token;
-	console.log(oauth);
-});
-*/
+// Endpoint for analyzing message sentiment on the TypeSense REST API
+const endpoint = "http://127.0.0.1:5000/TypeSense/api/analyze_sentiment"
 
-// REST API endpoints
-const CREATE_USER = "http://localhost:5000/TypeSense/api/create_user";
-const VALIDATE_USER = "http://localhost:5000/TypeSense/api/validate_user";
-const UPDATE_CONVERSATION = "http://localhost:5000/TypeSense/api/update_conversation";
+// Creates an HTTP GET request
+const get = (url, credentials, callback) => {
+  let xhr = new XMLHttpRequest();
+  xhr.onreadystatechange = () => {
+    if (xhr.readyState == 4 && xhr.status == 200) {
+      callback(xhr.responseText);
+    }
+  }
+
+  xhr.open("GET", url, true);
+  xhr.setRequestHeader("Authorization", "Basic " + btoa(credentials["username"] + ':' + credentials["password"]));
+  xhr.send(null);
+}
 
 // Creates an HTTP POST request
-const POST = (url, payload, callback) => {
+const post = (url, payload, callback) => {
 	let xhr = new XMLHttpRequest();
 	xhr.open("POST", url, true);
 	xhr.setRequestHeader("Content-type", "application/json");
 	xhr.onreadystatechange = () => {
-		if (xhr.readyState == XMLHttpRequest.DONE && xhr.status == 200) // readyState == 4
-			callback(xhr.responseText);
+		if (xhr.readyState == XMLHttpRequest.DONE && xhr.status == 200) { // readyState == 4
+			callback(xhr.responseText, payload["threadID"]);
+    }
 	}
-	xhr.send(JSON.stringify(payload));
+	xhr.send(JSON.stringify(payload["messages"]));
 }
 
 // Sends a message to content scripts running in the current tab
-const MESSAGE = (content) => {
+const message = (content) => {
 	chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
 		let activeTab = tabs[0];
 		chrome.tabs.sendMessage(activeTab.id, content);
 	});
 }
 
-// NOTE: Set to "true" for testing only
-storage.set({"signed-up": false}, function() {
-	console.log("Signed-up is set to false.");
-});
+storage.set({"100003186456548": []}, () => { return; }); // TEMP: For testing
 
 
-/* Event Listeners */
+/* Event Handlers */
 
 
-// Listens for messenger.com to be loaded and sends "inject-listeners" to listeners.js
+// Listens for messenger.com to be loaded and tells listeners.js to inject the event handlers
 chrome.webNavigation.onCompleted.addListener((details) => {
 	if (details.url.includes("messenger.com")) {
-		storage.get("signed-up", (signup) => {
-			if (signup["signed-up"]) {
-				MESSAGE({"message": "inject-listeners"}); // Tells listeners.js to inject event listeners
-			}
-		});
+		message({"message": "injectListeners"});
 	}
 });
 
-// Sets "signed-up" to false on first install
+// Listens for when the extension is first installed or updated
 chrome.runtime.onInstalled.addListener((details) => {
 	if (details.reason == "install") {
 		console.log("User has installed TypeSense for the first time on this device.");
-		storage.set({"signed-up": false}, function() {
-			console.log("Signed-up is set to false.");
-		});
 	} else if (details.reason == "update") {
 		let thisVersion = chrome.runtime.getManifest().version;
 		console.log("Updated from " + details.previousVersion + " to " + thisVersion + " :)");
 	}
 });
 
-// Listens for long-lived port connections (from content scripts)
+// Opens long-lived port connections with content scripts
 chrome.runtime.onConnect.addListener((port) => {
 	port.onMessage.addListener((msg) => {
-		if (port.name == "register") { // Handles requests from the "register" port (registration.js)
-			let addUser = (user) => {
-				if (JSON.parse(user).registered) { // Successful registration
-					console.log("Email is valid. Registering user.");
-					// TODO: FFS, fix this.
-					storage.set({"credentials": {"email": msg.email, "password": msg.password}}, () => {
-						port.postMessage({type: "registered", value: true});
-						storage.set({"onboarding": true}, () => {
-							console.log("Onboarding set to true.");
-						});
-						storage.set({"signed-up": true}, () => {
-							console.log("Signed-up set to true.");
-						});
+    if (port.name == "listener") { // Handles requests from listeners.js
+			storage.get(msg["threadID"], (conversation) => {
+				// Memoization of analyzed messages (only works for the inIsolation() method)
+				var newMessages = msg["messages"];
+				var oldMessages = conversation[msg["threadID"]];
 
-						MESSAGE({"message": "first-signup"}); // Tells onboarding.js to prompt the onboarding dialog
-						console.log("Listeners injected.")
-						MESSAGE({"message": "inject-listeners"}); // Tells listeners.js to inject event listeners
-					});
-				} else { // Unsuccessful registration
-					console.log("Email is already in use. Try again.");
-					port.postMessage({type: "registered", value: false});
+				for (let newIdx = 0; newIdx < newMessages.length; newIdx++) {
+					for (let oldIdx = 0; oldIdx < oldMessages.length; oldIdx++) {
+						// Stores sentiment of matching message in cache
+						if (newMessages[newIdx]["message"] == oldMessages[oldIdx]["message"]) {
+							newMessages[newIdx]["sentiment"] = oldMessages[oldIdx]["sentiment"];
+							break;
+						}
+					}
 				}
-			}
-			POST(CREATE_USER, {"email": msg.email, "fb_id": msg.fb_id, "password": msg.password}, addUser);
-		} else if (port.name == "login") { // Handles requests from the "login" port (registration.js)
-			let validateUser = (user) => {
-				if (JSON.parse(user).logged_in) { // Successful validation
-					console.log("Valid credentials. Logging in user.");
-					port.postMessage({type: "logged-in", value: true});
-					storage.set({"signed-up": true}, () => {
-						console.log("Signed-up set to true.");
-					});
-					storage.set({"onboarding": false}, () => {
-						console.log("Onboarding set to false.");
-					});
 
-					MESSAGE({"message": "inject-listeners"}); // Tells listeners.js to inject event listeners
-				} else { // Unsuccessful validation
-					console.log("Invalid credentials. Try again.");
-					port.postMessage({type: "logged-in", value: false});
-				}
-			}
-			POST(VALIDATE_USER, {"email": msg.email, "password": msg.password}, validateUser);
-		} else if (port.name == "listener") { // Handles requests from listeners.js
-		 	let updateConversation = (messages) => {
-				storage.set({"data": messages}, () => {
-					console.log("Populated local data storage.");
+        let payload = {"messages": newMessages, "threadID": msg["threadID"]};
+				post(endpoint, payload, (response, threadID) => {
+					let sentimentTable = JSON.parse(response)["sentiment_table"];
+					sentimentTable.sort((m, n) => { return m["id"] - n["id"]; });
+
+					if (sentimentTable.length > 17) {
+						sentimentTable = sentimentTable.slice(sentimentTable.length - 17);
+					}
+
+          storage.set({threadID: sentimentTable}, () => {
+            console.log("Updated thread's sentiment table.");
+          });
+
+          storage.set({"currentThread": sentimentTable}, () => {
+            console.log("Updated current thread's sentiment table.");
+          });
+
+          // Updates the browser action icon according to sentiment change
+          if (sentimentTable[sentimentTable.length - 1]["sentiment"] >= sentimentTable[sentimentTable.length - 2]["sentiment"]) { // Sentiment increased
+            chrome.browserAction.setIcon({path: "../assets/icon_green.png"});
+          } else { // Sentiment decreased
+            chrome.browserAction.setIcon({path: "../assets/icon_red.png"});
+          }
 				});
-				MESSAGE({"message": "conversation-update", "messages": JSON.parse(messages)}); // Tells popup.js to update the graph
-			}
-			storage.get("credentials", (creds) => {
-				POST(UPDATE_CONVERSATION, {"email": creds["credentials"]["email"], "fb_id": "test"/*msg.fb_id*/, "messages": msg.messages}, updateConversation);
 			});
-		} else if (port.name == "popup") {
-			if (msg.browser_action_clicked)
-				MESSAGE({"message": "prompt-signup"});
-		}
-	});
+    }
+  });
 });
